@@ -1,0 +1,1019 @@
+from paddleocr import PaddleOCR
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+# --- 1. Configuración de PaddleOCR ---
+ocr = PaddleOCR(
+    text_recognition_model_name="PP-OCRv4_server_rec",
+    use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    use_textline_orientation=False,
+    text_det_unclip_ratio=1.1
+)
+
+# --- CONFIGURACIÓN ---
+image_path = 'cons.png'
+
+texts_to_erase = ["Ferretteria","conones.", 'aprovaze', "horaio"]
+texts_to_add = ["Ferretería", "conoces", 'aprovecha', "horario"]
+texts_to_sample_color_from = ["especial", "calidad", "visita","visita"]
+
+offsets_x = [0]
+offsets_y = [0]
+
+font_path = 'Montserrat-Bold.ttf'
+font_size = 80
+
+# ═══════════════════════════════════════════════════════════
+# ⚙️ PANEL DE CONTROL - ESTRATEGIA DE MÁSCARA INTELIGENTE
+# ═══════════════════════════════════════════════════════════
+
+# 🎯 ESTRATEGIA DE BORRADO
+# Opciones: "box_shrink", "morphology", "smart_mask"
+ERASE_STRATEGY = "morphology"  # ⭐ RECOMENDADO para texto
+
+# --- PARA "box_shrink" (tu método original mejorado) ---
+BOX_SHRINK_TOP = 0.15
+BOX_SHRINK_BOTTOM = 0.15
+BOX_SHRINK_LEFT = 0.03
+BOX_SHRINK_RIGHT = 0.03
+
+# --- PARA "morphology" (detecta forma real del texto) ---
+MORPH_DILATE_KERNEL = 3      # Expansión del área de borrado (1-7)
+MORPH_ERODE_KERNEL = 2       # Contracción para ajustar (0-5)
+BRIGHTNESS_THRESHOLD = 30    # Diferencia mínima con fondo (20-60) - Reducido para texto en banner dorado
+
+# 🛡️ PROTECCIÓN CONTRA BORRAR PALABRAS CERCANAS (MEJORADA)
+PROTECT_NEARBY_WORDS = True   # Excluir áreas de otras palabras detectadas
+NEARBY_DISTANCE_THRESHOLD = 30 # Distancia máxima para considerar "cercana" (píxeles)
+EXCLUSION_PADDING = 3      # Padding adicional alrededor de palabras protegidas
+EXCLUSION_BRIGHTNESS_THRESHOLD = 50  # Umbral para detectar texto vecino - Reducido para mejor detección
+EXCLUSION_MIN_AREA = 50  # Área mínima en píxeles para considerar que hay texto real
+
+# --- PARA "smart_mask" (combina ambos métodos) ---
+USE_SMART_MASK = True        # Combinar morfología + reducción de caja
+
+# 🎨 MUESTREO DE COLOR
+COLOR_SHRINK = 0.35
+MIN_SATURATION = 50
+MIN_VALUE = 50
+EXCLUDE_EXTREMES = True
+
+# 🔧 INPAINTING
+INPAINT_RADIUS = 3
+INPAINT_METHOD = cv2.INPAINT_TELEA
+
+# 🐛 DEBUG
+DEBUG_SHOW_MASKS = True  # Mostrar máscaras intermedias para depuración
+
+print("═" * 70)
+print("⚙️  CONFIGURACIÓN ACTIVA")
+print("═" * 70)
+print(f"Estrategia de borrado: {ERASE_STRATEGY}")
+if ERASE_STRATEGY == "morphology":
+    print(f"  Dilatación: {MORPH_DILATE_KERNEL}, Erosión: {MORPH_ERODE_KERNEL}")
+    print(f"  Umbral de brillo: {BRIGHTNESS_THRESHOLD}")
+elif ERASE_STRATEGY == "box_shrink":
+    print(f"  Reducción: T={BOX_SHRINK_TOP} B={BOX_SHRINK_BOTTOM} L={BOX_SHRINK_LEFT} R={BOX_SHRINK_RIGHT}")
+print(f"Color: Área={COLOR_SHRINK}, Sat≥{MIN_SATURATION}, Val≥{MIN_VALUE}")
+print(f"Inpaint: Radio={INPAINT_RADIUS}")
+print(f"🛡️ Protección palabras cercanas: {'ON' if PROTECT_NEARBY_WORDS else 'OFF'}")
+if PROTECT_NEARBY_WORDS:
+    print(f"  Distancia umbral: {NEARBY_DISTANCE_THRESHOLD}px, Padding: {EXCLUSION_PADDING}px")
+    print(f"  Umbral detección texto vecino: {EXCLUSION_BRIGHTNESS_THRESHOLD}")
+print("═" * 70)
+
+# --- Validación ---
+if len(texts_to_erase) != len(texts_to_add) or len(texts_to_erase) != len(texts_to_sample_color_from):
+    print("❌ Error: Las listas deben tener la misma longitud.")
+    exit()
+
+if not isinstance(offsets_x, list):
+    offsets_x = [offsets_x] * len(texts_to_erase)
+elif len(offsets_x) == 1:
+    offsets_x = offsets_x * len(texts_to_erase)
+
+if not isinstance(offsets_y, list):
+    offsets_y = [offsets_y] * len(texts_to_erase)
+elif len(offsets_y) == 1:
+    offsets_y = offsets_y * len(texts_to_erase)
+
+# --- 2. Cargar imagen ---
+img_bgr = cv2.imread(image_path)
+if img_bgr is None:
+    print(f"❌ Error: No se pudo cargar '{image_path}'")
+    exit()
+h_img, w_img = img_bgr.shape[:2]
+
+# --- 3. Ejecutar OCR ---
+result = ocr.predict(image_path)
+
+# ═══════════════════════════════════════════════════════════
+# 🔧 FUNCIONES DE BORRADO INTELIGENTE
+# ═══════════════════════════════════════════════════════════
+
+def expand_polygon(polygon, expand_percent, min_expansion_px):
+    """Expandir polígono en todas direcciones para asegurar cobertura completa."""
+    points = np.array(polygon).astype(np.float32)
+    
+    x_coords = points[:, 0]
+    y_coords = points[:, 1]
+    
+    x_min, x_max = np.min(x_coords), np.max(x_coords)
+    y_min, y_max = np.min(y_coords), np.max(y_coords)
+    
+    width = x_max - x_min
+    height = y_max - y_min
+    
+    # Calcular expansión como porcentaje del tamaño, pero respetando el mínimo
+    expand_x = max(width * expand_percent, min_expansion_px)
+    expand_y = max(height * expand_percent, min_expansion_px)
+    
+    # Expandir en todas direcciones
+    new_x_min = x_min - expand_x
+    new_x_max = x_max + expand_x
+    new_y_min = y_min - expand_y
+    new_y_max = y_max + expand_y
+    
+    # Crear nuevo polígono expandido
+    expanded_polygon = np.array([
+        [new_x_min, new_y_min],
+        [new_x_max, new_y_min],
+        [new_x_max, new_y_max],
+        [new_x_min, new_y_max]
+    ], dtype=np.int32)
+    
+    return expanded_polygon
+
+def create_mask_box_shrink(polygon, top, bottom, left, right):
+    """Método 1: Reducir caja del OCR (OBSOLETO - usar expand_polygon)."""
+    points = np.array(polygon).astype(np.float32)
+    
+    x_coords = points[:, 0]
+    y_coords = points[:, 1]
+    
+    x_min, x_max = np.min(x_coords), np.max(x_coords)
+    y_min, y_max = np.min(y_coords), np.max(y_coords)
+    
+    width = x_max - x_min
+    height = y_max - y_min
+    
+    new_x_min = x_min + width * left
+    new_x_max = x_max - width * right
+    new_y_min = y_min + height * top
+    new_y_max = y_max - height * bottom
+    
+    new_polygon = np.array([
+        [new_x_min, new_y_min],
+        [new_x_max, new_y_min],
+        [new_x_max, new_y_max],
+        [new_x_min, new_y_max]
+    ], dtype=np.int32)
+    
+    return new_polygon
+
+def polygon_distance_to_others(polygon, all_other_polygons):
+    """Calcula la distancia mínima a otras palabras detectadas."""
+    points = np.array(polygon).astype(np.int32)
+    
+    # Obtener bounding box
+    x_min, x_max = int(np.min(points[:, 0])), int(np.max(points[:, 0]))
+    y_min, y_max = int(np.min(points[:, 1])), int(np.max(points[:, 1]))
+    
+    min_distance = float('inf')
+    closest_direction = None  # 'top', 'bottom', 'left', 'right'
+    
+    for other_poly in all_other_polygons:
+        other_points = np.array(other_poly).astype(np.int32)
+        other_x_min = int(np.min(other_points[:, 0]))
+        other_x_max = int(np.max(other_points[:, 0]))
+        other_y_min = int(np.min(other_points[:, 1]))
+        other_y_max = int(np.max(other_points[:, 1]))
+        
+        # Calcular distancias en cada dirección
+        dist_bottom = other_y_min - y_max  # Distancia hacia abajo
+        dist_top = y_min - other_y_max      # Distancia hacia arriba
+        dist_right = other_x_min - x_max    # Distancia hacia derecha
+        dist_left = x_min - other_x_max     # Distancia hacia izquierda
+        
+        # Encontrar la mínima (considerar solo positivas = no superpuestas)
+        distances = {
+            'bottom': dist_bottom if dist_bottom > 0 else float('inf'),
+            'top': dist_top if dist_top > 0 else float('inf'),
+            'right': dist_right if dist_right > 0 else float('inf'),
+            'left': dist_left if dist_left > 0 else float('inf')
+        }
+        
+        min_dir = min(distances, key=distances.get)
+        if distances[min_dir] < min_distance:
+            min_distance = distances[min_dir]
+            closest_direction = min_dir
+    
+    return min_distance, closest_direction
+
+def create_exclusion_mask(target_polygon, nearby_polygons, h_img, w_img, img_bgr):
+    """Crea una máscara de exclusión para proteger TEXTO REAL de palabras cercanas."""
+    exclusion_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+    
+    if not PROTECT_NEARBY_WORDS or nearby_polygons is None or len(nearby_polygons) == 0:
+        return exclusion_mask
+    
+    target_points = np.array(target_polygon).astype(np.int32)
+    target_x_min = int(np.min(target_points[:, 0]))
+    target_x_max = int(np.max(target_points[:, 0]))
+    target_y_min = int(np.min(target_points[:, 1]))
+    target_y_max = int(np.max(target_points[:, 1]))
+    
+    protected_count = 0
+    for other_poly in nearby_polygons:
+        other_points = np.array(other_poly).astype(np.int32)
+        other_x_min = int(np.min(other_points[:, 0]))
+        other_x_max = int(np.max(other_points[:, 0]))
+        other_y_min = int(np.min(other_points[:, 1]))
+        other_y_max = int(np.max(other_points[:, 1]))
+        
+        # Calcular distancia mínima entre bounding boxes
+        dist_bottom = other_y_min - target_y_max
+        dist_top = target_y_min - other_y_max
+        dist_right = other_x_min - target_x_max
+        dist_left = target_x_min - other_x_max
+        
+        # Si hay superposición o están muy cerca
+        min_dist = min([
+            dist_bottom if dist_bottom > 0 else float('inf'),
+            dist_top if dist_top > 0 else float('inf'),
+            dist_right if dist_right > 0 else float('inf'),
+            dist_left if dist_left > 0 else float('inf')
+        ])
+        
+        # Si están superpuestas o muy cerca (dentro del umbral)
+        if min_dist <= NEARBY_DISTANCE_THRESHOLD or dist_bottom <= 0 or dist_top <= 0 or dist_right <= 0 or dist_left <= 0:
+            # 🆕 EN LUGAR DE PROTEGER TODA LA CAJA, DETECTAR EL TEXTO REAL
+            # Extraer ROI de la palabra vecina
+            padding_detect = 5
+            roi_x_min = max(0, other_x_min - padding_detect)
+            roi_y_min = max(0, other_y_min - padding_detect)
+            roi_x_max = min(w_img, other_x_max + padding_detect)
+            roi_y_max = min(h_img, other_y_max + padding_detect)
+            
+            roi_neighbor = img_bgr[roi_y_min:roi_y_max, roi_x_min:roi_x_max]
+            
+            if roi_neighbor.size > 0:
+                # Detectar texto real en la palabra vecina usando morfología
+                roi_gray = cv2.cvtColor(roi_neighbor, cv2.COLOR_BGR2GRAY)
+                
+                # Calcular brillo del fondo
+                border_pixels = np.concatenate([
+                    roi_gray[0, :] if roi_gray.shape[0] > 0 else np.array([]),
+                    roi_gray[-1, :] if roi_gray.shape[0] > 0 else np.array([]),
+                    roi_gray[:, 0] if roi_gray.shape[1] > 0 else np.array([]),
+                    roi_gray[:, -1] if roi_gray.shape[1] > 0 else np.array([])
+                ])
+                
+                if len(border_pixels) > 0:
+                    bg_brightness = np.median(border_pixels)
+                    
+                    # 🆕 Detectar píxeles de texto vecino con umbral MÁS ESTRICTO
+                    if bg_brightness > 128:  # Fondo claro
+                        _, text_mask = cv2.threshold(
+                            roi_gray, 
+                            bg_brightness - EXCLUSION_BRIGHTNESS_THRESHOLD, 
+                            255, 
+                            cv2.THRESH_BINARY_INV
+                        )
+                    else:  # Fondo oscuro
+                        _, text_mask = cv2.threshold(
+                            roi_gray, 
+                            bg_brightness + EXCLUSION_BRIGHTNESS_THRESHOLD, 
+                            255, 
+                            cv2.THRESH_BINARY
+                        )
+                    
+                    # 🆕 Limpiar ruido AGRESIVAMENTE (eliminar píxeles sueltos y manchas pequeñas)
+                    kernel_clean = np.ones((3, 3), np.uint8)
+                    text_mask = cv2.morphologyEx(text_mask, cv2.MORPH_OPEN, kernel_clean, iterations=1)
+                    text_mask = cv2.morphologyEx(text_mask, cv2.MORPH_CLOSE, kernel_clean, iterations=1)
+                    
+                    # 🆕 Verificar que el área detectada sea significativa
+                    text_area = np.sum(text_mask > 0)
+                    if text_area < EXCLUSION_MIN_AREA:
+                        # No hay suficiente texto, ignorar esta palabra vecina
+                        continue
+                    
+                    # Dilatar MODERADAMENTE para margen de seguridad
+                    kernel_dilate = np.ones((EXCLUSION_PADDING * 2, EXCLUSION_PADDING * 2), np.uint8)
+                    text_mask = cv2.dilate(text_mask, kernel_dilate, iterations=1)
+                    
+                    # 🆕 Solo añadir si hay superposición real con el área objetivo
+                    # (evitar proteger áreas que no se superponen)
+                    temp_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+                    temp_mask[roi_y_min:roi_y_max, roi_x_min:roi_x_max] = text_mask
+                    
+                    # Verificar superposición con bounding box del objetivo
+                    if (roi_x_max < target_x_min or roi_x_min > target_x_max or
+                        roi_y_max < target_y_min or roi_y_min > target_y_max):
+                        # No hay superposición, ignorar
+                        continue
+                    
+                    # Colocar la máscara de texto real en la máscara de exclusión
+                    exclusion_mask[roi_y_min:roi_y_max, roi_x_min:roi_x_max] = cv2.bitwise_or(
+                        exclusion_mask[roi_y_min:roi_y_max, roi_x_min:roi_x_max],
+                        text_mask
+                    )
+                    protected_count += 1
+    
+    if protected_count > 0:
+        print(f"    🛡️ Protegido texto real de {protected_count} palabra(s) cercana(s)")
+    else:
+        print(f"    ℹ️  No se encontraron palabras cercanas dentro del umbral ({NEARBY_DISTANCE_THRESHOLD}px)")
+    
+    return exclusion_mask
+
+def create_mask_morphology(polygon, img_bgr, nearby_words=None):
+    """Método 2: Detectar forma real del texto con morfología (LÓGICA ORIGINAL SIMPLE)."""
+    points = np.array(polygon).astype(np.int32)
+    
+    # Obtener ROI
+    x_coords = points[:, 0]
+    y_coords = points[:, 1]
+    x_min, x_max = int(np.min(x_coords)), int(np.max(x_coords))
+    y_min, y_max = int(np.min(y_coords)), int(np.max(y_coords))
+    
+    # Añadir padding
+    padding = 10
+    x_min = max(0, x_min - padding)
+    y_min = max(0, y_min - padding)
+    x_max = min(w_img, x_max + padding)
+    y_max = min(h_img, y_max + padding)
+    
+    roi = img_bgr[y_min:y_max, x_min:x_max]
+    
+    if roi.size == 0:
+        # Fallback: usar polígono original
+        mask = np.zeros((h_img, w_img), dtype=np.uint8)
+        cv2.fillPoly(mask, [points], 255)
+        return mask, points
+    
+    # Convertir a escala de grises
+    roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    
+    # Calcular brillo del fondo (mediana de los bordes)
+    border_pixels = np.concatenate([
+        roi_gray[0, :],      # Superior
+        roi_gray[-1, :],     # Inferior
+        roi_gray[:, 0],      # Izquierda
+        roi_gray[:, -1]      # Derecha
+    ])
+    bg_brightness = np.median(border_pixels)
+    
+    # Calcular brillo del centro (donde probablemente está el texto)
+    center_y, center_x = roi_gray.shape[0] // 2, roi_gray.shape[1] // 2
+    center_region = roi_gray[max(0, center_y-5):min(roi_gray.shape[0], center_y+5),
+                            max(0, center_x-10):min(roi_gray.shape[1], center_x+10)]
+    center_brightness = np.median(center_region) if center_region.size > 0 else bg_brightness
+    
+    # Detectar si el texto es más claro o más oscuro que el fondo
+    text_is_darker = center_brightness < bg_brightness - 10
+    text_is_brighter = center_brightness > bg_brightness + 10
+    
+    # Crear máscara binaria: detectar tanto texto oscuro como claro
+    if text_is_darker or (bg_brightness > 128 and not text_is_brighter):  # Texto oscuro sobre fondo claro
+        _, mask_roi = cv2.threshold(
+            roi_gray, 
+            bg_brightness - BRIGHTNESS_THRESHOLD, 
+            255, 
+            cv2.THRESH_BINARY_INV
+        )
+    elif text_is_brighter:  # Texto claro sobre fondo oscuro/dorado
+        _, mask_roi = cv2.threshold(
+            roi_gray, 
+            bg_brightness + BRIGHTNESS_THRESHOLD, 
+            255, 
+            cv2.THRESH_BINARY
+        )
+    else:  # Fallback: usar método adaptativo
+        mask_roi = cv2.adaptiveThreshold(
+            roi_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY_INV, 11, 2
+        )
+    
+    # Operaciones morfológicas para limpiar
+    if MORPH_DILATE_KERNEL > 0:
+        kernel_dilate = np.ones((MORPH_DILATE_KERNEL, MORPH_DILATE_KERNEL), np.uint8)
+        mask_roi = cv2.dilate(mask_roi, kernel_dilate, iterations=1)
+    
+    if MORPH_ERODE_KERNEL > 0:
+        kernel_erode = np.ones((MORPH_ERODE_KERNEL, MORPH_ERODE_KERNEL), np.uint8)
+        mask_roi = cv2.erode(mask_roi, kernel_erode, iterations=1)
+    
+    # Colocar máscara ROI en la imagen completa
+    mask_full = np.zeros((h_img, w_img), dtype=np.uint8)
+    mask_full[y_min:y_max, x_min:x_max] = mask_roi
+    
+    # Debug: mostrar área detectada antes de exclusiones
+    area_before = np.sum(mask_full > 0)
+    
+    # 🛡️ EXCLUIR TEXTO REAL DE PALABRAS CERCANAS (MEJORADO)
+    if PROTECT_NEARBY_WORDS and nearby_words is not None and len(nearby_words) > 0:
+        exclusion_mask = create_exclusion_mask(polygon, nearby_words, h_img, w_img, img_bgr)
+        exclusion_area = np.sum(exclusion_mask > 0)
+        # Restar las áreas protegidas (solo texto real) de la máscara de borrado
+        mask_full = cv2.bitwise_and(mask_full, cv2.bitwise_not(exclusion_mask))
+        area_after = np.sum(mask_full > 0)
+        if exclusion_area > 0:
+            print(f"      📊 Área antes: {area_before}px, Exclusiones: {exclusion_area}px, Área después: {area_after}px")
+    else:
+        print(f"      📊 Área detectada: {area_before}px")
+    
+    # Encontrar contorno para visualización
+    contours, _ = cv2.findContours(mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        # Obtener el contorno más grande
+        largest_contour = max(contours, key=cv2.contourArea)
+        # Ajustar coordenadas al sistema de la imagen completa
+        largest_contour = largest_contour + np.array([x_min, y_min])
+        vis_polygon = largest_contour.squeeze()
+    else:
+        vis_polygon = points
+    
+    return mask_full, vis_polygon
+
+def create_mask_smart(polygon, img_bgr, nearby_words=None):
+    """Método 3: Combinar morfología + reducción de caja."""
+    # Primero reducir la caja
+    shrunk_poly = create_mask_box_shrink(
+        polygon, 
+        BOX_SHRINK_TOP, BOX_SHRINK_BOTTOM, 
+        BOX_SHRINK_LEFT, BOX_SHRINK_RIGHT
+    )
+    
+    # Luego aplicar morfología dentro de esa caja reducida
+    mask_morph, vis_poly = create_mask_morphology(shrunk_poly, img_bgr, nearby_words=nearby_words)
+    
+    return mask_morph, vis_poly
+
+def sample_color_robust(polygon_points, img_bgr):
+    """Muestreo robusto de color usando MORFOLOGÍA para detectar solo píxeles de texto."""
+    polygon_points = np.array(polygon_points).astype(np.int32)
+    
+    # Obtener ROI del polígono
+    x_coords = polygon_points[:, 0]
+    y_coords = polygon_points[:, 1]
+    x_min, x_max = int(np.min(x_coords)), int(np.max(x_coords))
+    y_min, y_max = int(np.min(y_coords)), int(np.max(y_coords))
+    
+    # Añadir padding para asegurar que capturamos el texto completo
+    padding = 5
+    x_min = max(0, x_min - padding)
+    y_min = max(0, y_min - padding)
+    x_max = min(w_img, x_max + padding)
+    y_max = min(h_img, y_max + padding)
+    
+    roi = img_bgr[y_min:y_max, x_min:x_max]
+    
+    if roi.size == 0:
+        return (0, 0, 255), None, (x_min, y_min, x_max, y_max)
+    
+    # Convertir a escala de grises para detectar texto
+    roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    
+    # Calcular brillo del fondo (mediana de los bordes)
+    border_pixels = np.concatenate([
+        roi_gray[0, :] if roi_gray.shape[0] > 0 else np.array([]),
+        roi_gray[-1, :] if roi_gray.shape[0] > 0 else np.array([]),
+        roi_gray[:, 0] if roi_gray.shape[1] > 0 else np.array([]),
+        roi_gray[:, -1] if roi_gray.shape[1] > 0 else np.array([])
+    ])
+    
+    if len(border_pixels) == 0:
+        # Fallback: usar método anterior
+        return sample_color_robust_fallback(polygon_points, img_bgr)
+    
+    bg_brightness = np.median(border_pixels)
+    
+    # Calcular brillo del centro (donde probablemente está el texto)
+    center_y, center_x = roi_gray.shape[0] // 2, roi_gray.shape[1] // 2
+    center_region = roi_gray[max(0, center_y-5):min(roi_gray.shape[0], center_y+5),
+                            max(0, center_x-10):min(roi_gray.shape[1], center_x+10)]
+    center_brightness = np.median(center_region) if center_region.size > 0 else bg_brightness
+    
+    # Detectar si el texto es más claro o más oscuro que el fondo
+    text_is_darker = center_brightness < bg_brightness - 10
+    text_is_brighter = center_brightness > bg_brightness + 10
+    
+    # Crear máscara binaria para detectar SOLO el texto
+    if text_is_darker or (bg_brightness > 128 and not text_is_brighter):  # Texto oscuro sobre fondo claro
+        _, text_mask = cv2.threshold(
+            roi_gray, 
+            bg_brightness - BRIGHTNESS_THRESHOLD, 
+            255, 
+            cv2.THRESH_BINARY_INV
+        )
+    elif text_is_brighter:  # Texto claro sobre fondo oscuro/dorado
+        _, text_mask = cv2.threshold(
+            roi_gray, 
+            bg_brightness + BRIGHTNESS_THRESHOLD, 
+            255, 
+            cv2.THRESH_BINARY
+        )
+    else:  # Fallback: usar método adaptativo
+        text_mask = cv2.adaptiveThreshold(
+            roi_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY_INV, 11, 2
+        )
+    
+    # Limpiar ruido con morfología
+    kernel_clean = np.ones((3, 3), np.uint8)
+    text_mask = cv2.morphologyEx(text_mask, cv2.MORPH_OPEN, kernel_clean, iterations=1)
+    text_mask = cv2.morphologyEx(text_mask, cv2.MORPH_CLOSE, kernel_clean, iterations=1)
+    
+    # Verificar que hay suficiente texto detectado
+    text_area = np.sum(text_mask > 0)
+    if text_area < 10:  # Muy poco texto detectado, usar fallback
+        return sample_color_robust_fallback(polygon_points, img_bgr)
+    
+    # 🎯 MUESTREAR COLOR SOLO DE LOS PÍXELES DE TEXTO (ignorar fondo)
+    roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+    
+    # Crear máscara booleana para píxeles de texto
+    text_mask_bool = text_mask > 0
+    
+    # Extraer solo los píxeles que son texto
+    text_pixels_rgb = roi_rgb[text_mask_bool]
+    
+    if len(text_pixels_rgb) < 5:
+        # Si hay muy pocos píxeles, usar fallback
+        return sample_color_robust_fallback(polygon_points, img_bgr)
+    
+    # Filtrar píxeles extremos si está habilitado
+    if EXCLUDE_EXTREMES and len(text_pixels_rgb) > 20:
+        brightness = np.mean(text_pixels_rgb, axis=1)
+        p10 = np.percentile(brightness, 10)
+        p90 = np.percentile(brightness, 90)
+        mask_range = (brightness >= p10) & (brightness <= p90)
+        text_pixels_rgb = text_pixels_rgb[mask_range]
+    
+    # Calcular color mediano del texto
+    if len(text_pixels_rgb) > 0:
+        color_rgb = np.median(text_pixels_rgb, axis=0).astype(np.uint8)
+    else:
+        # Fallback si no quedan píxeles
+        return sample_color_robust_fallback(polygon_points, img_bgr)
+    
+    # Convertir a BGR para OpenCV
+    text_color = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
+    
+    print(f"      🎨 Color muestreado (solo texto): RGB({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]}) - {text_area}px de texto detectado")
+    
+    return text_color, color_rgb, (x_min, y_min, x_max, y_max)
+
+def sample_color_robust_fallback(polygon_points, img_bgr):
+    """Método fallback para muestreo de color (método original)."""
+    polygon_points = np.array(polygon_points).astype(np.int32)
+    
+    M = cv2.moments(polygon_points)
+    if M["m00"] != 0:
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+    else:
+        cx = int(np.mean(polygon_points[:, 0]))
+        cy = int(np.mean(polygon_points[:, 1]))
+    
+    x_coords = polygon_points[:, 0]
+    y_coords = polygon_points[:, 1]
+    width = np.max(x_coords) - np.min(x_coords)
+    height = np.max(y_coords) - np.min(y_coords)
+    
+    sample_w = int(width * COLOR_SHRINK)
+    sample_h = int(height * COLOR_SHRINK)
+    
+    x1 = max(0, cx - sample_w // 2)
+    y1 = max(0, cy - sample_h // 2)
+    x2 = min(w_img, cx + sample_w // 2)
+    y2 = min(h_img, cy + sample_h // 2)
+    
+    roi = img_bgr[y1:y2, x1:x2]
+    
+    if roi.size == 0:
+        return (0, 0, 255), None, (x1, y1, x2, y2)
+    
+    roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+    
+    pixels_hsv = roi_hsv.reshape(-1, 3)
+    pixels_rgb = roi_rgb.reshape(-1, 3)
+    
+    mask = (pixels_hsv[:, 1] >= MIN_SATURATION) & (pixels_hsv[:, 2] >= MIN_VALUE)
+    
+    if np.sum(mask) < 10:
+        mask = (pixels_hsv[:, 1] >= MIN_SATURATION // 2) & (pixels_hsv[:, 2] >= MIN_VALUE // 2)
+    
+    valid_pixels = pixels_rgb[mask]
+    
+    if len(valid_pixels) < 5:
+        valid_pixels = pixels_rgb
+    
+    if EXCLUDE_EXTREMES and len(valid_pixels) > 20:
+        brightness = np.mean(valid_pixels, axis=1)
+        p10 = np.percentile(brightness, 10)
+        p90 = np.percentile(brightness, 90)
+        mask_range = (brightness >= p10) & (brightness <= p90)
+        valid_pixels = valid_pixels[mask_range]
+    
+    if len(valid_pixels) > 0:
+        color_rgb = np.median(valid_pixels, axis=0).astype(np.uint8)
+    else:
+        color_rgb = np.median(pixels_rgb, axis=0).astype(np.uint8)
+    
+    text_color = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
+    
+    return text_color, color_rgb, (x1, y1, x2, y2)
+
+# ═══════════════════════════════════════════════════════════
+# 📊 PROCESAMIENTO
+# ═══════════════════════════════════════════════════════════
+
+img_original_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+img_preview = np.copy(img_original_rgb)
+mask = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
+
+target_polygons = {}
+color_sample_polygons = {}
+erase_polygons_vis = {}
+
+print("\n📝 PROCESANDO OCR...")
+
+if result:
+    for page_result in result:
+        rec_texts = page_result.get('rec_texts', [])
+        rec_polygons = page_result.get('rec_polys', [])
+
+        for text, polygon in zip(rec_texts, rec_polygons):
+            points = np.array(polygon).astype(np.int32)
+            
+            if text in texts_to_erase:
+                idx = texts_to_erase.index(text)
+                cv2.polylines(img_preview, [points], True, (255, 50, 50), 1)
+                target_polygons[text] = polygon
+                print(f"  ✓ '{text}' (índice {idx})")
+            
+            elif text in texts_to_sample_color_from:
+                color_sample_polygons[text] = polygon
+                cv2.polylines(img_preview, [points], True, (50, 50, 255), 1)
+                print(f"  ✓ '{text}' para color")
+
+# Verificar
+missing = []
+for erase, sample in zip(texts_to_erase, texts_to_sample_color_from):
+    if erase not in target_polygons:
+        missing.append(f"'{erase}'")
+    if sample not in color_sample_polygons:
+        missing.append(f"'{sample}'")
+
+if missing:
+    print(f"\n❌ No encontradas: {', '.join(missing)}")
+    exit()
+
+# --- Crear Máscaras de Borrado ---
+print(f"\n🎯 CREANDO MÁSCARAS ({ERASE_STRATEGY})...")
+
+# 🆕 Recopilar todas las palabras detectadas (para detección de cercanía)
+all_detected_polygons = []
+if result:
+    for page_result in result:
+        rec_polygons = page_result.get('rec_polys', [])
+        all_detected_polygons.extend(rec_polygons)
+
+for i, text_to_erase in enumerate(texts_to_erase):
+    # Crear lista de polígonos vecinos (todos excepto el actual)
+    other_polygons = [p for p in all_detected_polygons 
+                      if not np.array_equal(p, target_polygons[text_to_erase])]
+    
+    if ERASE_STRATEGY == "box_shrink":
+        # LÓGICA ORIGINAL SIMPLE
+        erase_poly = create_mask_box_shrink(
+            target_polygons[text_to_erase],
+            BOX_SHRINK_TOP, BOX_SHRINK_BOTTOM,
+            BOX_SHRINK_LEFT, BOX_SHRINK_RIGHT
+        )
+        mask_temp = np.zeros((h_img, w_img), dtype=np.uint8)
+        cv2.fillPoly(mask_temp, [erase_poly], 255)
+        
+        # 🛡️ EXCLUIR TEXTO REAL DE PALABRAS CERCANAS (MEJORADO)
+        if PROTECT_NEARBY_WORDS and len(other_polygons) > 0:
+            exclusion_mask = create_exclusion_mask(
+                target_polygons[text_to_erase], other_polygons, h_img, w_img, img_bgr
+            )
+            # Restar las áreas protegidas (solo texto real) de la máscara de borrado
+            mask_temp = cv2.bitwise_and(mask_temp, cv2.bitwise_not(exclusion_mask))
+        
+        mask = cv2.bitwise_or(mask, mask_temp)
+        erase_polygons_vis[text_to_erase] = erase_poly
+        
+    elif ERASE_STRATEGY == "morphology":
+        # 🆕 Pasar información de palabras cercanas
+        mask_temp, erase_poly = create_mask_morphology(
+            target_polygons[text_to_erase], img_bgr, nearby_words=other_polygons
+        )
+        mask = cv2.bitwise_or(mask, mask_temp)
+        erase_polygons_vis[text_to_erase] = erase_poly
+        
+    elif ERASE_STRATEGY == "smart_mask":
+        mask_temp, erase_poly = create_mask_smart(
+            target_polygons[text_to_erase], img_bgr, nearby_words=other_polygons
+        )
+        mask = cv2.bitwise_or(mask, mask_temp)
+        erase_polygons_vis[text_to_erase] = erase_poly
+    
+    # Visualizar
+    if erase_poly.ndim == 2:
+        cv2.polylines(img_preview, [erase_poly.astype(np.int32)], True, (0, 255, 0), 2)
+    
+    print(f"  {i+1}. '{text_to_erase}' procesada")
+
+# 🐛 DEBUG: Guardar máscaras de exclusión si está activado
+debug_exclusion_masks = {}
+if DEBUG_SHOW_MASKS:
+    # Recrear máscaras para debug
+    for text_to_erase in texts_to_erase:
+        other_polygons = [p for p in all_detected_polygons 
+                          if not np.array_equal(p, target_polygons[text_to_erase])]
+        if PROTECT_NEARBY_WORDS and len(other_polygons) > 0:
+            excl_mask = create_exclusion_mask(
+                target_polygons[text_to_erase], other_polygons, h_img, w_img, img_bgr
+            )
+            debug_exclusion_masks[text_to_erase] = excl_mask
+
+# 🐛 DEBUG: Mostrar máscaras si está activado
+if DEBUG_SHOW_MASKS:
+    fig = plt.figure(figsize=(20, 13))
+    
+    # 1. Original con polígonos detectados
+    plt.subplot(3, 3, 1)
+    plt.imshow(img_original_rgb)
+    for text in texts_to_erase:
+        poly = np.array(target_polygons[text]).astype(np.int32)
+        cv2.polylines(img_original_rgb, [poly], True, (255, 0, 0), 2)
+    plt.title('1. OCR - Polígonos Originales (Rojo)', fontsize=10, fontweight='bold')
+    plt.axis('off')
+    
+    # 2. Polígonos de borrado
+    img_erase = img_original_rgb.copy()
+    for text in texts_to_erase:
+        orig_poly = np.array(target_polygons[text]).astype(np.int32)
+        cv2.polylines(img_erase, [orig_poly], True, (255, 0, 0), 2)
+        if text in erase_polygons_vis:
+            erase_poly = np.array(erase_polygons_vis[text]).astype(np.int32)
+            cv2.polylines(img_erase, [erase_poly], True, (0, 255, 0), 2)
+    plt.subplot(3, 3, 2)
+    plt.imshow(img_erase)
+    plt.title('2. Polígonos (Rojo=OCR, Verde=Borrado)', fontsize=10, fontweight='bold')
+    plt.axis('off')
+    
+    # 3. Máscara de borrado (blanco y negro)
+    plt.subplot(3, 3, 3)
+    plt.imshow(mask, cmap='gray')
+    plt.title('3. Máscara de Borrado (Blanco=Se Borrará)', fontsize=10, fontweight='bold')
+    plt.axis('off')
+    
+    # 4. Máscaras de exclusión (texto vecino protegido)
+    plt.subplot(3, 3, 4)
+    combined_exclusion = np.zeros((h_img, w_img), dtype=np.uint8)
+    for text, excl_mask in debug_exclusion_masks.items():
+        combined_exclusion = cv2.bitwise_or(combined_exclusion, excl_mask)
+    plt.imshow(combined_exclusion, cmap='hot')
+    plt.title('4. Texto Vecino Protegido (Blanco=Protegido)', fontsize=10, fontweight='bold')
+    plt.axis('off')
+    
+    # 5. Máscara final (borrado - exclusión)
+    plt.subplot(3, 3, 5)
+    final_mask = mask.copy()
+    for excl_mask in debug_exclusion_masks.values():
+        final_mask = cv2.bitwise_and(final_mask, cv2.bitwise_not(excl_mask))
+    plt.imshow(final_mask, cmap='gray')
+    plt.title('5. Máscara FINAL (después de exclusiones)', fontsize=10, fontweight='bold')
+    plt.axis('off')
+    
+    # 6. Overlay de borrado (rojo semi-transparente)
+    plt.subplot(3, 3, 6)
+    mask_overlay = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).copy()
+    mask_overlay[final_mask > 0] = [255, 0, 0]  # Rojo donde se borrará
+    img_overlay = cv2.addWeighted(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), 0.6, mask_overlay, 0.4, 0)
+    plt.imshow(img_overlay)
+    plt.title('6. Preview Borrado (Rojo Semi-transparente)', fontsize=10, fontweight='bold')
+    plt.axis('off')
+    
+    # 7. Original completo
+    plt.subplot(3, 3, 7)
+    plt.imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    plt.title('7. Imagen Original', fontsize=10, fontweight='bold')
+    plt.axis('off')
+    
+    # 8. Comparación lado a lado
+    plt.subplot(3, 3, 8)
+    comparison = np.hstack([
+        cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
+        cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    ])
+    comparison[0:h_img, 0:w_img][mask > 0] = [255, 100, 100]  # Izquierda: máscara original
+    comparison[0:h_img, w_img:][final_mask > 0] = [255, 0, 0]  # Derecha: máscara final
+    plt.imshow(comparison)
+    plt.title('8. Comparación (Izq: Original, Der: Con Exclusiones)', fontsize=10, fontweight='bold')
+    plt.axis('off')
+    
+    # 9. Estadísticas
+    plt.subplot(3, 3, 9)
+    plt.axis('off')
+    stats_text = f"📊 ESTADÍSTICAS\n\n"
+    stats_text += f"Palabras a borrar: {len(texts_to_erase)}\n"
+    for i, text in enumerate(texts_to_erase):
+        poly = target_polygons[text]
+        points = np.array(poly)
+        width = np.max(points[:, 0]) - np.min(points[:, 0])
+        height = np.max(points[:, 1]) - np.min(points[:, 1])
+        stats_text += f"\n'{text}':\n"
+        stats_text += f"  Tamaño: {width:.0f}x{height:.0f}px\n"
+    
+    mask_area = np.sum(mask > 0)
+    final_mask_calc = mask.copy()
+    for excl_mask in debug_exclusion_masks.values():
+        final_mask_calc = cv2.bitwise_and(final_mask_calc, cv2.bitwise_not(excl_mask))
+    final_mask_area = np.sum(final_mask_calc > 0)
+    exclusion_area = mask_area - final_mask_area
+    img_area = mask.size
+    
+    stats_text += f"\n📏 ÁREAS:\n"
+    stats_text += f"Máscara original: {mask_area:,} px\n"
+    stats_text += f"Exclusiones: {exclusion_area:,} px\n"
+    stats_text += f"Máscara final: {final_mask_area:,} px\n"
+    stats_text += f"({final_mask_area/img_area*100:.2f}% de la imagen)\n"
+    
+    stats_text += f"\n🛡️ PROTECCIÓN:\n"
+    if len(debug_exclusion_masks) > 0:
+        stats_text += f"Palabras protegidas: {len(debug_exclusion_masks)}\n"
+        stats_text += f"Reducción: {exclusion_area/mask_area*100:.1f}%\n"
+    else:
+        stats_text += "Sin palabras protegidas\n"
+    
+    plt.text(0.1, 0.5, stats_text, fontsize=9, family='monospace', 
+             verticalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    plt.title('9. Información Detallada', fontsize=10, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print("\n" + "═" * 70)
+    print("🐛 DEBUG: Máscaras mostradas. Revisa las ventanas de visualización.")
+    print("═" * 70 + "\n")
+
+# --- Muestrear Colores ---
+print(f"\n🎨 MUESTREANDO COLORES...")
+text_colors = {}
+
+for i, (text_to_erase, text_to_sample) in enumerate(zip(texts_to_erase, texts_to_sample_color_from)):
+    color_poly = color_sample_polygons[text_to_sample]
+    text_color, color_rgb, sample_area = sample_color_robust(color_poly, img_bgr)
+    text_colors[text_to_erase] = text_color
+    
+    x1, y1, x2, y2 = sample_area
+    cv2.rectangle(img_preview, (x1, y1), (x2, y2), (255, 255, 0), 2)
+    
+    # Dibujar cuadrado de color
+    size = 25
+    x_color = x2 + 5
+    y_color = y1
+    if x_color + size < w_img:
+        cv2.rectangle(img_preview, (x_color, y_color), (x_color + size, y_color + size), text_color, -1)
+        cv2.rectangle(img_preview, (x_color, y_color), (x_color + size, y_color + size), (255, 255, 255), 1)
+    
+    if color_rgb is not None:
+        print(f"  {i+1}. '{text_to_erase}' → RGB({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]})")
+
+# --- Inpainting ---
+print(f"\n🔧 INPAINTING...")
+img_inpainted_bgr = cv2.inpaint(img_bgr, mask, INPAINT_RADIUS, INPAINT_METHOD)
+
+# --- Reemplazar ---
+print(f"\n✏️  REEMPLAZANDO...")
+
+try:
+    font = ImageFont.truetype(font_path, size=font_size)
+except IOError:
+    print(f"❌ Fuente no encontrada")
+    exit()
+
+img_final_bgr = np.copy(img_inpainted_bgr)
+
+for i, (text_to_erase, text_to_add, offset_x, offset_y) in enumerate(
+    zip(texts_to_erase, texts_to_add, offsets_x, offsets_y)
+):
+    print(f"  {i+1}. '{text_to_erase}' → '{text_to_add}'...", end=" ")
+    
+    target_polygon = target_polygons[text_to_erase]
+    text_color = text_colors[text_to_erase]
+    
+    # Calcular el bounding box del texto
+    # getbbox retorna (left, top, right, bottom) donde:
+    # - left: generalmente 0 o pequeño
+    # - top: negativo (representa el ascenso, espacio arriba de la línea base)
+    # - right: ancho del texto
+    # - bottom: positivo (representa el descenso, espacio abajo de la línea base)
+    text_bbox = font.getbbox(text_to_add)
+    text_w = text_bbox[2] - text_bbox[0]  # Ancho del texto
+    text_h = text_bbox[3] - text_bbox[1]   # Alto total (ascenso + descenso)
+    text_ascent = -text_bbox[1]            # Ascenso (espacio arriba de la línea base, positivo)
+    text_descent = text_bbox[3]            # Descenso (espacio abajo de la línea base, positivo)
+    
+    padding = 20
+    
+    # Crear imagen temporal con suficiente espacio
+    src_w = text_w + 2 * padding
+    src_h = text_h + 2 * padding
+    
+    # En PIL, cuando dibujamos texto en (x, y), 'y' es la coordenada Y de la línea base
+    # Necesitamos posicionar el texto de manera que quede centrado verticalmente
+    # en el área disponible, considerando el ascenso
+    text_x = padding
+    # La línea base debe estar en una posición tal que el texto quede bien centrado
+    # Si queremos que el texto empiece en Y=padding (considerando el ascenso),
+    # entonces la línea base debe estar en padding + text_ascent
+    text_y = padding + text_ascent  # Línea base del texto
+    
+    img_src_text_pil = Image.new('RGBA', (src_w, src_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img_src_text_pil)
+    draw.text((text_x, text_y), text_to_add, font=font,
+              fill=(text_color[2], text_color[1], text_color[0], 255))
+    
+    img_src_text_bgra = cv2.cvtColor(np.array(img_src_text_pil), cv2.COLOR_RGBA2BGRA)
+    
+    # src_polygon: rectángulo que encierra el texto dibujado
+    # El texto se dibuja con la línea base en text_y, entonces:
+    # - Y superior = text_y - text_ascent (donde empieza el texto visualmente)
+    # - Y inferior = text_y + text_descent (donde termina el texto visualmente)
+    text_real_x = text_x
+    text_real_y = text_y - text_ascent  # Y superior del texto (línea base - ascenso)
+    text_real_w = text_w
+    text_real_h = text_ascent + text_descent  # Altura total = ascenso + descenso
+    
+    # src_polygon: rectángulo que encierra exactamente el texto dibujado
+    src_polygon = np.float32([
+        [text_real_x, text_real_y],                           # Esquina superior izquierda
+        [text_real_x + text_real_w, text_real_y],              # Esquina superior derecha
+        [text_real_x + text_real_w, text_real_y + text_real_h], # Esquina inferior derecha
+        [text_real_x, text_real_y + text_real_h]               # Esquina inferior izquierda
+    ])
+    
+    # dst_polygon: polígono del texto original (sin offsets por defecto)
+    # Solo aplicar offsets si son diferentes de 0
+    if offset_x != 0 or offset_y != 0:
+        adjusted_polygon = [[p[0] + offset_x, p[1] + offset_y] for p in target_polygon]
+        dst_polygon = np.float32(adjusted_polygon)
+    else:
+        dst_polygon = np.float32(target_polygon)
+    
+    M = cv2.getPerspectiveTransform(src_polygon, dst_polygon)
+    img_warped_bgra = cv2.warpPerspective(img_src_text_bgra, M, (w_img, h_img))
+    
+    alpha_channel = img_warped_bgra[:, :, 3] / 255.0
+    inv_alpha = 1.0 - alpha_channel
+    
+    for c in range(3):
+        img_final_bgr[:, :, c] = (inv_alpha * img_final_bgr[:, :, c] +
+                                   alpha_channel * img_warped_bgra[:, :, c])
+    
+    print("✓")
+
+# --- Visualización ---
+print(f"\n📊 MOSTRANDO...\n")
+
+plt.figure(figsize=(28, 7))
+
+plt.subplot(1, 4, 1)
+plt.imshow(img_original_rgb)
+plt.title('1. Original', fontsize=14, fontweight='bold')
+plt.axis('off')
+
+plt.subplot(1, 4, 2)
+plt.imshow(img_preview)
+plt.title(f'2. Análisis\n(Rojo=OCR, Verde=Máscara {ERASE_STRATEGY})', fontsize=11)
+plt.axis('off')
+
+plt.subplot(1, 4, 3)
+plt.imshow(cv2.cvtColor(img_inpainted_bgr, cv2.COLOR_BGR2RGB))
+plt.title(f'3. Borrado', fontsize=12)
+plt.axis('off')
+
+plt.subplot(1, 4, 4)
+plt.imshow(cv2.cvtColor(img_final_bgr, cv2.COLOR_BGR2RGB))
+summary = ", ".join([f"'{e}'→'{a}'" for e, a in zip(texts_to_erase, texts_to_add)])
+plt.title(f'4. Resultado\n{summary}', fontsize=12, fontweight='bold')
+plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+print("═" * 70)
+print("✅ COMPLETADO")
+print("═" * 70)
