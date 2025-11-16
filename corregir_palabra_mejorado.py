@@ -15,11 +15,11 @@ ocr = PaddleOCR(
 
 # --- CONFIGURACIÓN ---
 
-image_path = 'lanco2.png'
+image_path = 'cons.png'
 
-texts_to_erase = ["Defintative","projecto.","mastira"," jVisitanos y aseura tu projecto con Lanco!" ]
-texts_to_add = ["Definitiva", "proyecto.", "maestra", " ¡Visitanos y asegura tu proyecto con Lanco!"]
-texts_to_sample_color_from = ["Superior", "durabilidad","durabilidad","Superior"]
+texts_to_erase = ["Ferretteria","conones.", 'aprovaze', "horaio"]
+texts_to_add = ["Ferretería", "conoces", 'aprovecha', "horario"]
+
 
 
 
@@ -96,8 +96,8 @@ if PROTECT_NEARBY_WORDS:
 print("═" * 70)
 
 # --- Validación ---
-if len(texts_to_erase) != len(texts_to_add) or len(texts_to_erase) != len(texts_to_sample_color_from):
-    print("❌ Error: Las listas deben tener la misma longitud.")
+if len(texts_to_erase) != len(texts_to_add):
+    print("❌ Error: Las listas texts_to_erase y texts_to_add deben tener la misma longitud.")
     exit()
 
 if not isinstance(offsets_x, list):
@@ -127,9 +127,14 @@ print("═" * 70)
 if result:
     for page_result in result:
         rec_texts = page_result.get('rec_texts', [])
+        rec_scores = page_result.get('rec_scores', [])
         if rec_texts:
             for idx, text in enumerate(rec_texts, 1):
-                print(f"  {idx}. '{text}'")
+                confidence = rec_scores[idx - 1] if idx - 1 < len(rec_scores) else None
+                if confidence is not None:
+                    print(f"  {idx}. '{text}' (confianza: {confidence:.2f})")
+                else:
+                    print(f"  {idx}. '{text}'")
         else:
             print("  No se detectaron palabras")
 else:
@@ -715,7 +720,6 @@ img_preview = np.copy(img_original_rgb)
 mask = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
 
 target_polygons = {}
-color_sample_polygons = {}
 erase_polygons_vis = {}
 
 print("\n📝 PROCESANDO OCR...")
@@ -733,23 +737,39 @@ if result:
                 cv2.polylines(img_preview, [points], True, (255, 50, 50), 1)
                 target_polygons[text] = polygon
                 print(f"  ✓ '{text}' (índice {idx})")
-            
-            elif text in texts_to_sample_color_from:
-                color_sample_polygons[text] = polygon
-                cv2.polylines(img_preview, [points], True, (50, 50, 255), 1)
-                print(f"  ✓ '{text}' para color")
 
-# Verificar
+# Verificar que todas las palabras a borrar estén presentes
 missing = []
-for erase, sample in zip(texts_to_erase, texts_to_sample_color_from):
+for erase in texts_to_erase:
     if erase not in target_polygons:
         missing.append(f"'{erase}'")
-    if sample not in color_sample_polygons:
-        missing.append(f"'{sample}'")
 
 if missing:
     print(f"\n❌ No encontradas: {', '.join(missing)}")
     exit()
+
+# --- Muestrear Colores ANTES del borrado ---
+print(f"\n🎨 MUESTREANDO COLORES (de las palabras a borrar)...")
+text_colors = {}
+
+for i, text_to_erase in enumerate(texts_to_erase):
+    color_poly = target_polygons[text_to_erase]
+    text_color, color_rgb, sample_area = sample_color_robust(color_poly, img_bgr)
+    text_colors[text_to_erase] = text_color
+    
+    x1, y1, x2, y2 = sample_area
+    cv2.rectangle(img_preview, (x1, y1), (x2, y2), (255, 255, 0), 2)
+    
+    # Dibujar cuadrado de color
+    size = 25
+    x_color = x2 + 5
+    y_color = y1
+    if x_color + size < w_img:
+        cv2.rectangle(img_preview, (x_color, y_color), (x_color + size, y_color + size), text_color, -1)
+        cv2.rectangle(img_preview, (x_color, y_color), (x_color + size, y_color + size), (255, 255, 255), 1)
+    
+    if color_rgb is not None:
+        print(f"  {i+1}. '{text_to_erase}' → RGB({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]})")
 
 # --- Crear Máscaras de Borrado ---
 print(f"\n🎯 CREANDO MÁSCARAS ({ERASE_STRATEGY})...")
@@ -942,29 +962,6 @@ if DEBUG_SHOW_MASKS:
     print("\n" + "═" * 70)
     print("🐛 DEBUG: Máscaras mostradas. Revisa las ventanas de visualización.")
     print("═" * 70 + "\n")
-
-# --- Muestrear Colores ---
-print(f"\n🎨 MUESTREANDO COLORES...")
-text_colors = {}
-
-for i, (text_to_erase, text_to_sample) in enumerate(zip(texts_to_erase, texts_to_sample_color_from)):
-    color_poly = color_sample_polygons[text_to_sample]
-    text_color, color_rgb, sample_area = sample_color_robust(color_poly, img_bgr)
-    text_colors[text_to_erase] = text_color
-    
-    x1, y1, x2, y2 = sample_area
-    cv2.rectangle(img_preview, (x1, y1), (x2, y2), (255, 255, 0), 2)
-    
-    # Dibujar cuadrado de color
-    size = 25
-    x_color = x2 + 5
-    y_color = y1
-    if x_color + size < w_img:
-        cv2.rectangle(img_preview, (x_color, y_color), (x_color + size, y_color + size), text_color, -1)
-        cv2.rectangle(img_preview, (x_color, y_color), (x_color + size, y_color + size), (255, 255, 255), 1)
-    
-    if color_rgb is not None:
-        print(f"  {i+1}. '{text_to_erase}' → RGB({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]})")
 
 # --- Inpainting ---
 print(f"\n🔧 INPAINTING...")

@@ -45,3 +45,26 @@ image_path = 'lanco2.png'
 texts_to_erase = ["Defintative","projecto.","mastira"," jVisitanos y aseura tu projecto con Lanco!" ]
 texts_to_add = ["Definitiva", "proyecto.", "maestra", " ¡Visitanos y asegura tu proyecto con Lanco!"]
 texts_to_sample_color_from = ["Superior", "durabilidad","durabilidad","Superior"]
+
+
+
+
+
+
+--------------------------------------------------
+
+image_path = 'tropi2.png'
+
+texts_to_erase = ["Semano.","espacos","tionda", " este fin de semano!"]
+texts_to_add = ["Semana", "espacios", "tienda", " este fin de semana!"]
+texts_to_sample_color_from = ["Tropical!", "Transforma","Tropical!","Tropical!"]
+
+
+
+
+---------------------------------------------------------
+image_path = 'tropi3.png'
+
+texts_to_erase = ["projectos","fnor","wemana!"]
+texts_to_add = ["proyectos", "de", "semana"]
+texts_to_sample_color_from = ["Colores", "Ferreteria","Ferreteria"]
