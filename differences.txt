@@ -35,3 +35,13 @@ image_path = 'nothe.png'
 texts_to_erase = ["graideza!","Dominnana.","Reabirmos","calendaria" ]
 texts_to_add = ["grandeza!", "Dominicana.", "Reabrimos", "calendario"]
 texts_to_sample_color_from = ["pausamos", "Dia","Dia","Marca"]
+
+
+
+------------------------------------------
+
+image_path = 'lanco2.png'
+
+texts_to_erase = ["Defintative","projecto.","mastira"," jVisitanos y aseura tu projecto con Lanco!" ]
+texts_to_add = ["Definitiva", "proyecto.", "maestra", " ¡Visitanos y asegura tu proyecto con Lanco!"]
+texts_to_sample_color_from = ["Superior", "durabilidad","durabilidad","Superior"]

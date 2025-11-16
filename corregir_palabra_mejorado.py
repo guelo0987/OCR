@@ -15,11 +15,11 @@ ocr = PaddleOCR(
 
 # --- CONFIGURACIÓN ---
 
-image_path = 'nothe.png'
+image_path = 'lanco2.png'
 
-texts_to_erase = ["graideza!","Dominnana.","Reabirmos","calendaria" ]
-texts_to_add = ["grandeza!", "Dominicana.", "Reabrimos", "calendario"]
-texts_to_sample_color_from = ["pausamos", "Dia","Dia","Marca"]
+texts_to_erase = ["Defintative","projecto.","mastira"," jVisitanos y aseura tu projecto con Lanco!" ]
+texts_to_add = ["Definitiva", "proyecto.", "maestra", " ¡Visitanos y asegura tu proyecto con Lanco!"]
+texts_to_sample_color_from = ["Superior", "durabilidad","durabilidad","Superior"]
 
 
 
@@ -136,43 +136,8 @@ else:
     print("  No se obtuvieron resultados del OCR")
 print("═" * 70 + "\n")
 
-# ═══════════════════════════════════════════════════════════
-# 🔧 FUNCIONES DE BORRADO INTELIGENTE
-# ═══════════════════════════════════════════════════════════
 
-def expand_polygon(polygon, expand_percent, min_expansion_px):
-    """Expandir polígono en todas direcciones para asegurar cobertura completa."""
-    points = np.array(polygon).astype(np.float32)
-    
-    x_coords = points[:, 0]
-    y_coords = points[:, 1]
-    
-    x_min, x_max = np.min(x_coords), np.max(x_coords)
-    y_min, y_max = np.min(y_coords), np.max(y_coords)
-    
-    width = x_max - x_min
-    height = y_max - y_min
-    
-    # Calcular expansión como porcentaje del tamaño, pero respetando el mínimo
-    expand_x = max(width * expand_percent, min_expansion_px)
-    expand_y = max(height * expand_percent, min_expansion_px)
-    
-    # Expandir en todas direcciones
-    new_x_min = x_min - expand_x
-    new_x_max = x_max + expand_x
-    new_y_min = y_min - expand_y
-    new_y_max = y_max + expand_y
-    
-    # Crear nuevo polígono expandido
-    expanded_polygon = np.array([
-        [new_x_min, new_y_min],
-        [new_x_max, new_y_min],
-        [new_x_max, new_y_max],
-        [new_x_min, new_y_max]
-    ], dtype=np.int32)
-    
-    return expanded_polygon
-
+# CREAMOS UN POLIGONO REDUCIDO PARA EL BORRADO DE LAS PALABRAS DETECTADAS POR OCR 
 def create_mask_box_shrink(polygon, top, bottom, left, right):
     """Método 1: Reducir caja del OCR (OBSOLETO - usar expand_polygon)."""
     points = np.array(polygon).astype(np.float32)
@@ -200,44 +165,7 @@ def create_mask_box_shrink(polygon, top, bottom, left, right):
     
     return new_polygon
 
-def polygon_distance_to_others(polygon, all_other_polygons):
-    """Calcula la distancia mínima a otras palabras detectadas."""
-    points = np.array(polygon).astype(np.int32)
-    
-    # Obtener bounding box
-    x_min, x_max = int(np.min(points[:, 0])), int(np.max(points[:, 0]))
-    y_min, y_max = int(np.min(points[:, 1])), int(np.max(points[:, 1]))
-    
-    min_distance = float('inf')
-    closest_direction = None  # 'top', 'bottom', 'left', 'right'
-    
-    for other_poly in all_other_polygons:
-        other_points = np.array(other_poly).astype(np.int32)
-        other_x_min = int(np.min(other_points[:, 0]))
-        other_x_max = int(np.max(other_points[:, 0]))
-        other_y_min = int(np.min(other_points[:, 1]))
-        other_y_max = int(np.max(other_points[:, 1]))
-        
-        # Calcular distancias en cada dirección
-        dist_bottom = other_y_min - y_max  # Distancia hacia abajo
-        dist_top = y_min - other_y_max      # Distancia hacia arriba
-        dist_right = other_x_min - x_max    # Distancia hacia derecha
-        dist_left = x_min - other_x_max     # Distancia hacia izquierda
-        
-        # Encontrar la mínima (considerar solo positivas = no superpuestas)
-        distances = {
-            'bottom': dist_bottom if dist_bottom > 0 else float('inf'),
-            'top': dist_top if dist_top > 0 else float('inf'),
-            'right': dist_right if dist_right > 0 else float('inf'),
-            'left': dist_left if dist_left > 0 else float('inf')
-        }
-        
-        min_dir = min(distances, key=distances.get)
-        if distances[min_dir] < min_distance:
-            min_distance = distances[min_dir]
-            closest_direction = min_dir
-    
-    return min_distance, closest_direction
+
 
 def create_exclusion_mask(target_polygon, nearby_polygons, h_img, w_img, img_bgr):
     """Crea una máscara de exclusión para proteger TEXTO REAL de palabras cercanas."""
