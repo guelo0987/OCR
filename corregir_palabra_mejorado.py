@@ -15,13 +15,13 @@ ocr = PaddleOCR(
 
 # --- CONFIGURACIÓN ---
 
+image_path = 'nothe.png'
+
+texts_to_erase = ["graideza!","Dominnana.","Reabirmos","calendaria" ]
+texts_to_add = ["grandeza!", "Dominicana.", "Reabrimos", "calendario"]
+texts_to_sample_color_from = ["pausamos", "Dia","Dia","Marca"]
 
 
-image_path = 'image.png'
-
-texts_to_erase = ["Mastira.","dle semardo" ]
-texts_to_add = ["Maestra.", "de semana"]
-texts_to_sample_color_from = ["Tropicales:", "fin"]
 
 
 offsets_x = [0]
@@ -52,10 +52,12 @@ POLYGON_EXPANSION_PX = 3     # Píxeles para expandir el polígono original ante
 
 # 🛡️ PROTECCIÓN CONTRA BORRAR PALABRAS CERCANAS (MEJORADA)
 PROTECT_NEARBY_WORDS = True   # Excluir áreas de otras palabras detectadas
-NEARBY_DISTANCE_THRESHOLD = 30 # Distancia máxima para considerar "cercana" (píxeles)
-EXCLUSION_PADDING = 3      # Padding adicional alrededor de palabras protegidas
-EXCLUSION_BRIGHTNESS_THRESHOLD = 50  # Umbral para detectar texto vecino - Reducido para mejor detección
-EXCLUSION_MIN_AREA = 50  # Área mínima en píxeles para considerar que hay texto real
+NEARBY_DISTANCE_THRESHOLD = 20 # Distancia máxima para considerar "cercana" (píxeles) - Reducido para ser más estricto
+EXCLUSION_PADDING = 5      # Padding adicional alrededor de palabras protegidas - Aumentado para mejor protección
+EXCLUSION_BRIGHTNESS_THRESHOLD = 40  # Umbral para detectar texto vecino - Reducido para capturar más texto
+EXCLUSION_MIN_AREA = 30  # Área mínima en píxeles para considerar que hay texto real - Reducido
+EXCLUSION_OVERLAP_RATIO = 0.5  # Máximo 50% de superposición para considerar como vecino (no parte del texto a borrar)
+EXCLUSION_USE_POLYGON = True  # Usar el polígono original del vecino como base de protección (más robusto)
 
 # --- PARA "smart_mask" (combina ambos métodos) ---
 USE_SMART_MASK = False        # Combinar morfología + reducción de caja
@@ -89,6 +91,8 @@ print(f"🛡️ Protección palabras cercanas: {'ON' if PROTECT_NEARBY_WORDS els
 if PROTECT_NEARBY_WORDS:
     print(f"  Distancia umbral: {NEARBY_DISTANCE_THRESHOLD}px, Padding: {EXCLUSION_PADDING}px")
     print(f"  Umbral detección texto vecino: {EXCLUSION_BRIGHTNESS_THRESHOLD}")
+    print(f"  Superposición máxima permitida: {EXCLUSION_OVERLAP_RATIO*100:.0f}% (solo protege si está principalmente fuera)")
+    print(f"  Usar polígono original: {'SÍ' if EXCLUSION_USE_POLYGON else 'NO'} (más robusto)")
 print("═" * 70)
 
 # --- Validación ---
@@ -262,6 +266,31 @@ def create_exclusion_mask(target_polygon, nearby_polygons, h_img, w_img, img_bgr
         dist_right = other_x_min - target_x_max
         dist_left = target_x_min - other_x_max
         
+        # 🆕 Verificar si el texto vecino está COMPLETAMENTE DENTRO del área objetivo
+        # Si está completamente dentro, NO es un vecino a proteger, es parte del texto a borrar
+        neighbor_inside_target = (
+            other_x_min >= target_x_min and 
+            other_x_max <= target_x_max and 
+            other_y_min >= target_y_min and 
+            other_y_max <= target_y_max
+        )
+        
+        # Si el vecino está completamente dentro del área objetivo, ignorarlo (es parte del texto a borrar)
+        if neighbor_inside_target:
+            continue
+        
+        # Calcular superposición entre bounding boxes
+        overlap_x = max(0, min(target_x_max, other_x_max) - max(target_x_min, other_x_min))
+        overlap_y = max(0, min(target_y_max, other_y_max) - max(target_y_min, other_y_min))
+        overlap_area = overlap_x * overlap_y
+        
+        # Calcular área del vecino
+        neighbor_area = (other_x_max - other_x_min) * (other_y_max - other_y_min)
+        
+        # 🆕 Solo proteger si el vecino está PRINCIPALMENTE FUERA del área objetivo
+        # (más del X% del vecino debe estar fuera del área objetivo)
+        overlap_ratio = overlap_area / neighbor_area if neighbor_area > 0 else 0
+        
         # Si hay superposición o están muy cerca
         min_dist = min([
             dist_bottom if dist_bottom > 0 else float('inf'),
@@ -270,9 +299,24 @@ def create_exclusion_mask(target_polygon, nearby_polygons, h_img, w_img, img_bgr
             dist_left if dist_left > 0 else float('inf')
         ])
         
-        # Si están superpuestas o muy cerca (dentro del umbral)
-        if min_dist <= NEARBY_DISTANCE_THRESHOLD or dist_bottom <= 0 or dist_top <= 0 or dist_right <= 0 or dist_left <= 0:
-            # 🆕 EN LUGAR DE PROTEGER TODA LA CAJA, DETECTAR EL TEXTO REAL
+        # 🆕 Solo proteger si:
+        # 1. Está cerca (dentro del umbral) O hay superposición
+        # 2. Y el vecino está principalmente FUERA del área objetivo (menos del umbral de superposición)
+        is_nearby = min_dist <= NEARBY_DISTANCE_THRESHOLD or dist_bottom <= 0 or dist_top <= 0 or dist_right <= 0 or dist_left <= 0
+        is_mostly_outside = overlap_ratio < EXCLUSION_OVERLAP_RATIO  # Menos del umbral de superposición
+        
+        if is_nearby and is_mostly_outside:
+            # 🆕 ESTRATEGIA MEJORADA: Combinar polígono original + detección morfológica
+            # Crear máscara base usando el polígono original del vecino (más robusto)
+            neighbor_polygon_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+            cv2.fillPoly(neighbor_polygon_mask, [other_points], 255)
+            
+            # Expandir el polígono con padding para asegurar protección completa
+            if EXCLUSION_PADDING > 0:
+                kernel_expand = np.ones((EXCLUSION_PADDING * 2 + 1, EXCLUSION_PADDING * 2 + 1), np.uint8)
+                neighbor_polygon_mask = cv2.dilate(neighbor_polygon_mask, kernel_expand, iterations=1)
+            
+            # 🆕 También detectar texto real con morfología para capturar partes que puedan estar fuera del polígono
             # Extraer ROI de la palabra vecina
             padding_detect = 5
             roi_x_min = max(0, other_x_min - padding_detect)
@@ -297,59 +341,82 @@ def create_exclusion_mask(target_polygon, nearby_polygons, h_img, w_img, img_bgr
                 if len(border_pixels) > 0:
                     bg_brightness = np.median(border_pixels)
                     
-                    # 🆕 Detectar píxeles de texto vecino con umbral MÁS ESTRICTO
+                    # Detectar píxeles de texto vecino
                     if bg_brightness > 128:  # Fondo claro
-                        _, text_mask = cv2.threshold(
+                        _, text_mask_roi = cv2.threshold(
                             roi_gray, 
                             bg_brightness - EXCLUSION_BRIGHTNESS_THRESHOLD, 
                             255, 
                             cv2.THRESH_BINARY_INV
                         )
                     else:  # Fondo oscuro
-                        _, text_mask = cv2.threshold(
+                        _, text_mask_roi = cv2.threshold(
                             roi_gray, 
                             bg_brightness + EXCLUSION_BRIGHTNESS_THRESHOLD, 
                             255, 
                             cv2.THRESH_BINARY
                         )
                     
-                    # 🆕 Limpiar ruido AGRESIVAMENTE (eliminar píxeles sueltos y manchas pequeñas)
+                    # Limpiar ruido
                     kernel_clean = np.ones((3, 3), np.uint8)
-                    text_mask = cv2.morphologyEx(text_mask, cv2.MORPH_OPEN, kernel_clean, iterations=1)
-                    text_mask = cv2.morphologyEx(text_mask, cv2.MORPH_CLOSE, kernel_clean, iterations=1)
+                    text_mask_roi = cv2.morphologyEx(text_mask_roi, cv2.MORPH_OPEN, kernel_clean, iterations=1)
+                    text_mask_roi = cv2.morphologyEx(text_mask_roi, cv2.MORPH_CLOSE, kernel_clean, iterations=1)
                     
-                    # 🆕 Verificar que el área detectada sea significativa
-                    text_area = np.sum(text_mask > 0)
-                    if text_area < EXCLUSION_MIN_AREA:
-                        # No hay suficiente texto, ignorar esta palabra vecina
-                        continue
+                    # Expandir la máscara morfológica
+                    if EXCLUSION_PADDING > 0:
+                        kernel_dilate = np.ones((EXCLUSION_PADDING * 2 + 1, EXCLUSION_PADDING * 2 + 1), np.uint8)
+                        text_mask_roi = cv2.dilate(text_mask_roi, kernel_dilate, iterations=1)
                     
-                    # Dilatar MODERADAMENTE para margen de seguridad
-                    kernel_dilate = np.ones((EXCLUSION_PADDING * 2, EXCLUSION_PADDING * 2), np.uint8)
-                    text_mask = cv2.dilate(text_mask, kernel_dilate, iterations=1)
+                    # Colocar la máscara morfológica en coordenadas de la imagen completa
+                    text_mask_full = np.zeros((h_img, w_img), dtype=np.uint8)
+                    text_mask_full[roi_y_min:roi_y_max, roi_x_min:roi_x_max] = text_mask_roi
                     
-                    # 🆕 Solo añadir si hay superposición real con el área objetivo
-                    # (evitar proteger áreas que no se superponen)
-                    temp_mask = np.zeros((h_img, w_img), dtype=np.uint8)
-                    temp_mask[roi_y_min:roi_y_max, roi_x_min:roi_x_max] = text_mask
+                    # 🆕 COMBINAR: Usar el polígono original O la detección morfológica (lo que sea mayor)
+                    # Esto asegura que se proteja todo el texto, incluso si la detección morfológica falla
+                    if EXCLUSION_USE_POLYGON:
+                        # Combinar ambas máscaras (unión)
+                        combined_mask = cv2.bitwise_or(neighbor_polygon_mask, text_mask_full)
+                    else:
+                        # Solo usar detección morfológica
+                        combined_mask = text_mask_full
                     
-                    # Verificar superposición con bounding box del objetivo
-                    if (roi_x_max < target_x_min or roi_x_min > target_x_max or
-                        roi_y_max < target_y_min or roi_y_min > target_y_max):
-                        # No hay superposición, ignorar
-                        continue
+                    # 🆕 Restar el área objetivo (solo proteger lo que está FUERA)
+                    target_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+                    cv2.fillPoly(target_mask, [target_points], 255)
+                    # Expandir un poco el área objetivo para asegurar que no se proteja lo que se debe borrar
+                    if EXCLUSION_PADDING > 0:
+                        kernel_target = np.ones((EXCLUSION_PADDING, EXCLUSION_PADDING), np.uint8)
+                        target_mask = cv2.dilate(target_mask, kernel_target, iterations=1)
                     
-                    # Colocar la máscara de texto real en la máscara de exclusión
-                    exclusion_mask[roi_y_min:roi_y_max, roi_x_min:roi_x_max] = cv2.bitwise_or(
-                        exclusion_mask[roi_y_min:roi_y_max, roi_x_min:roi_x_max],
-                        text_mask
-                    )
-                    protected_count += 1
+                    # Restar el área objetivo de la máscara combinada
+                    combined_mask = cv2.bitwise_and(combined_mask, cv2.bitwise_not(target_mask))
+                    
+                    # Verificar que quede área protegida
+                    protected_area = np.sum(combined_mask > 0)
+                    if protected_area >= EXCLUSION_MIN_AREA:
+                        # Añadir a la máscara de exclusión
+                        exclusion_mask = cv2.bitwise_or(exclusion_mask, combined_mask)
+                        protected_count += 1
+                else:
+                    # Si no se puede detectar morfológicamente, usar solo el polígono
+                    if EXCLUSION_USE_POLYGON:
+                        # Restar el área objetivo
+                        target_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+                        cv2.fillPoly(target_mask, [target_points], 255)
+                        if EXCLUSION_PADDING > 0:
+                            kernel_target = np.ones((EXCLUSION_PADDING, EXCLUSION_PADDING), np.uint8)
+                            target_mask = cv2.dilate(target_mask, kernel_target, iterations=1)
+                        
+                        neighbor_polygon_mask = cv2.bitwise_and(neighbor_polygon_mask, cv2.bitwise_not(target_mask))
+                        protected_area = np.sum(neighbor_polygon_mask > 0)
+                        if protected_area >= EXCLUSION_MIN_AREA:
+                            exclusion_mask = cv2.bitwise_or(exclusion_mask, neighbor_polygon_mask)
+                            protected_count += 1
     
     if protected_count > 0:
-        print(f"    🛡️ Protegido texto real de {protected_count} palabra(s) cercana(s)")
+        print(f"    🛡️ Protegido texto real de {protected_count} palabra(s) cercana(s) (solo partes fuera del área objetivo)")
     else:
-        print(f"    ℹ️  No se encontraron palabras cercanas dentro del umbral ({NEARBY_DISTANCE_THRESHOLD}px)")
+        print(f"    ℹ️  No se encontraron palabras cercanas válidas (umbral: {NEARBY_DISTANCE_THRESHOLD}px, superposición max: {EXCLUSION_OVERLAP_RATIO*100:.0f}%)")
     
     return exclusion_mask
 
@@ -451,45 +518,38 @@ def create_mask_morphology(polygon, img_bgr, nearby_words=None):
             mask_roi_cleaned[labels == i] = 255
     mask_roi = mask_roi_cleaned
     
-    # 🆕 RESTRICCIÓN AL POLÍGONO ORIGINAL (EXPANDIDO): Crear máscara del polígono expandido en el ROI
-    polygon_mask_roi = np.zeros((roi_gray.shape[0], roi_gray.shape[1]), dtype=np.uint8)
-    # Usar el polígono original para expandir
-    polygon_roi = polygon_roi_original.copy()
+    # 🆕 RESTRICCIÓN AL BOUNDING BOX COMPLETO: Usar el rectángulo completo que encierra el polígono
+    # Esto asegura que TODO el texto dentro de la caja detectada se borre correctamente
+    # Calcular bounding box del polígono original en coordenadas del ROI
+    polygon_roi_x_coords = polygon_roi_original[:, 0]
+    polygon_roi_y_coords = polygon_roi_original[:, 1]
+    bbox_x_min = int(np.min(polygon_roi_x_coords))
+    bbox_x_max = int(np.max(polygon_roi_x_coords))
+    bbox_y_min = int(np.min(polygon_roi_y_coords))
+    bbox_y_max = int(np.max(polygon_roi_y_coords))
     
-    # 🆕 Expandir el polígono un poco para permitir borrado más completo
-    if POLYGON_EXPANSION_PX > 0:
-        # Calcular el centro del polígono
-        M = cv2.moments(polygon_roi.astype(np.int32))
-        if M["m00"] != 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-        else:
-            cx = int(np.mean(polygon_roi[:, 0]))
-            cy = int(np.mean(polygon_roi[:, 1]))
-        
-        # Expandir desde el centro
-        expanded_polygon_roi = polygon_roi.copy()
-        for i in range(len(expanded_polygon_roi)):
-            dx = expanded_polygon_roi[i, 0] - cx
-            dy = expanded_polygon_roi[i, 1] - cy
-            # Normalizar y expandir
-            if dx != 0 or dy != 0:
-                length = np.sqrt(dx*dx + dy*dy)
-                expanded_polygon_roi[i, 0] = cx + (dx / length) * (length + POLYGON_EXPANSION_PX)
-                expanded_polygon_roi[i, 1] = cy + (dy / length) * (length + POLYGON_EXPANSION_PX)
-        polygon_roi = expanded_polygon_roi
+    # Expandir el bounding box con un padding para asegurar cobertura completa
+    bbox_expansion = max(POLYGON_EXPANSION_PX, 5)  # Mínimo 5px de expansión
+    bbox_x_min = max(0, bbox_x_min - bbox_expansion)
+    bbox_y_min = max(0, bbox_y_min - bbox_expansion)
+    bbox_x_max = min(roi_gray.shape[1], bbox_x_max + bbox_expansion)
+    bbox_y_max = min(roi_gray.shape[0], bbox_y_max + bbox_expansion)
     
-    cv2.fillPoly(polygon_mask_roi, [polygon_roi.astype(np.int32)], 255)
+    # Crear máscara del bounding box expandido (rectángulo completo)
+    bbox_mask_roi = np.zeros((roi_gray.shape[0], roi_gray.shape[1]), dtype=np.uint8)
+    bbox_mask_roi[bbox_y_min:bbox_y_max, bbox_x_min:bbox_x_max] = 255
     
-    # 🆕 Aplicar restricción: solo mantener píxeles dentro del polígono expandido
-    mask_roi = cv2.bitwise_and(mask_roi, polygon_mask_roi)
+    # 🆕 Aplicar restricción: solo mantener píxeles dentro del bounding box expandido
+    # Esto asegura que TODO el texto dentro de la caja se borre, no solo el del polígono
+    mask_roi = cv2.bitwise_and(mask_roi, bbox_mask_roi)
     
     # Operaciones morfológicas para limpiar y expandir
     if MORPH_DILATE_KERNEL > 0:
         kernel_dilate = np.ones((MORPH_DILATE_KERNEL, MORPH_DILATE_KERNEL), np.uint8)
         mask_roi = cv2.dilate(mask_roi, kernel_dilate, iterations=1)
-        # 🆕 Re-aplicar restricción después de dilatar (con polígono expandido)
-        mask_roi = cv2.bitwise_and(mask_roi, polygon_mask_roi)
+        # 🆕 Re-aplicar restricción después de dilatar (con bounding box expandido)
+        # Esto asegura que la dilatación no se salga del área de la caja detectada
+        mask_roi = cv2.bitwise_and(mask_roi, bbox_mask_roi)
     
     if MORPH_ERODE_KERNEL > 0:
         kernel_erode = np.ones((MORPH_ERODE_KERNEL, MORPH_ERODE_KERNEL), np.uint8)

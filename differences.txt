@@ -24,3 +24,14 @@ image_path = 'image.png'
 texts_to_erase = ["Mastira.","dle semardo" ]
 texts_to_add = ["Maestra.", "de semana"]
 texts_to_sample_color_from = ["Tropicales:", "fin"]
+
+
+
+
+
+--------------------------------------
+image_path = 'nothe.png'
+
+texts_to_erase = ["graideza!","Dominnana.","Reabirmos","calendaria" ]
+texts_to_add = ["grandeza!", "Dominicana.", "Reabrimos", "calendario"]
+texts_to_sample_color_from = ["pausamos", "Dia","Dia","Marca"]
