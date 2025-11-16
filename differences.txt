@@ -1,0 +1,26 @@
+image_path = 'lanco.png'
+
+texts_to_erase = ["Impecibables.","humidad", "iConsigue", "confitanca!"]
+texts_to_add = ["Impecables.", "humedad","Consigue", "confianza!"]
+texts_to_sample_color_from = ["Sella", "filtraciones.", "Sellador", "Sellador"]
+
+
+
+
+-------------------------------------
+image_path = 'cons.png'
+
+texts_to_erase = ["Ferretteria","conones.", 'aprovaze', "horaio"]
+texts_to_add = ["Ferretería", "conoces", 'aprovecha', "horario"]
+texts_to_sample_color_from = ["especial", "calidad", "visita","visita"]
+
+
+
+
+----------------------------------------
+
+image_path = 'image.png'
+
+texts_to_erase = ["Mastira.","dle semardo" ]
+texts_to_add = ["Maestra.", "de semana"]
+texts_to_sample_color_from = ["Tropicales:", "fin"]

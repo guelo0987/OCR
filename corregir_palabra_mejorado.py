@@ -14,11 +14,15 @@ ocr = PaddleOCR(
 )
 
 # --- CONFIGURACIÓN ---
-image_path = 'cons.png'
 
-texts_to_erase = ["Ferretteria","conones.", 'aprovaze', "horaio"]
-texts_to_add = ["Ferretería", "conoces", 'aprovecha', "horario"]
-texts_to_sample_color_from = ["especial", "calidad", "visita","visita"]
+
+
+image_path = 'image.png'
+
+texts_to_erase = ["Mastira.","dle semardo" ]
+texts_to_add = ["Maestra.", "de semana"]
+texts_to_sample_color_from = ["Tropicales:", "fin"]
+
 
 offsets_x = [0]
 offsets_y = [0]
@@ -41,9 +45,10 @@ BOX_SHRINK_LEFT = 0.03
 BOX_SHRINK_RIGHT = 0.03
 
 # --- PARA "morphology" (detecta forma real del texto) ---
-MORPH_DILATE_KERNEL = 3      # Expansión del área de borrado (1-7)
-MORPH_ERODE_KERNEL = 2       # Contracción para ajustar (0-5)
+MORPH_DILATE_KERNEL = 5      # Expansión del área de borrado (1-7) - Aumentado para borrar más
+MORPH_ERODE_KERNEL = 1       # Contracción para ajustar (0-5) - Reducido para no quitar tanto
 BRIGHTNESS_THRESHOLD = 30    # Diferencia mínima con fondo (20-60) - Reducido para texto en banner dorado
+POLYGON_EXPANSION_PX = 3     # Píxeles para expandir el polígono original antes de restringir (0-10)
 
 # 🛡️ PROTECCIÓN CONTRA BORRAR PALABRAS CERCANAS (MEJORADA)
 PROTECT_NEARBY_WORDS = True   # Excluir áreas de otras palabras detectadas
@@ -53,7 +58,7 @@ EXCLUSION_BRIGHTNESS_THRESHOLD = 50  # Umbral para detectar texto vecino - Reduc
 EXCLUSION_MIN_AREA = 50  # Área mínima en píxeles para considerar que hay texto real
 
 # --- PARA "smart_mask" (combina ambos métodos) ---
-USE_SMART_MASK = True        # Combinar morfología + reducción de caja
+USE_SMART_MASK = False        # Combinar morfología + reducción de caja
 
 # 🎨 MUESTREO DE COLOR
 COLOR_SHRINK = 0.35
@@ -75,6 +80,7 @@ print(f"Estrategia de borrado: {ERASE_STRATEGY}")
 if ERASE_STRATEGY == "morphology":
     print(f"  Dilatación: {MORPH_DILATE_KERNEL}, Erosión: {MORPH_ERODE_KERNEL}")
     print(f"  Umbral de brillo: {BRIGHTNESS_THRESHOLD}")
+    print(f"  Expansión polígono: {POLYGON_EXPANSION_PX}px")
 elif ERASE_STRATEGY == "box_shrink":
     print(f"  Reducción: T={BOX_SHRINK_TOP} B={BOX_SHRINK_BOTTOM} L={BOX_SHRINK_LEFT} R={BOX_SHRINK_RIGHT}")
 print(f"Color: Área={COLOR_SHRINK}, Sat≥{MIN_SATURATION}, Val≥{MIN_VALUE}")
@@ -109,6 +115,22 @@ h_img, w_img = img_bgr.shape[:2]
 
 # --- 3. Ejecutar OCR ---
 result = ocr.predict(image_path)
+
+# --- Mostrar todas las palabras detectadas ---
+print("\n" + "═" * 70)
+print("📝 PALABRAS DETECTADAS POR OCR:")
+print("═" * 70)
+if result:
+    for page_result in result:
+        rec_texts = page_result.get('rec_texts', [])
+        if rec_texts:
+            for idx, text in enumerate(rec_texts, 1):
+                print(f"  {idx}. '{text}'")
+        else:
+            print("  No se detectaron palabras")
+else:
+    print("  No se obtuvieron resultados del OCR")
+print("═" * 70 + "\n")
 
 # ═══════════════════════════════════════════════════════════
 # 🔧 FUNCIONES DE BORRADO INTELIGENTE
@@ -332,7 +354,7 @@ def create_exclusion_mask(target_polygon, nearby_polygons, h_img, w_img, img_bgr
     return exclusion_mask
 
 def create_mask_morphology(polygon, img_bgr, nearby_words=None):
-    """Método 2: Detectar forma real del texto con morfología (LÓGICA ORIGINAL SIMPLE)."""
+    """Método 2: Detectar forma real del texto con morfología (MEJORADO - Solo texto, no fondo)."""
     points = np.array(polygon).astype(np.int32)
     
     # Obtener ROI
@@ -341,14 +363,14 @@ def create_mask_morphology(polygon, img_bgr, nearby_words=None):
     x_min, x_max = int(np.min(x_coords)), int(np.max(x_coords))
     y_min, y_max = int(np.min(y_coords)), int(np.max(y_coords))
     
-    # Añadir padding
-    padding = 10
-    x_min = max(0, x_min - padding)
-    y_min = max(0, y_min - padding)
-    x_max = min(w_img, x_max + padding)
-    y_max = min(h_img, y_max + padding)
+    # Añadir padding más conservador
+    padding = 5  # Reducido de 10 a 5 para ser más preciso
+    x_min_padded = max(0, x_min - padding)
+    y_min_padded = max(0, y_min - padding)
+    x_max_padded = min(w_img, x_max + padding)
+    y_max_padded = min(h_img, y_max + padding)
     
-    roi = img_bgr[y_min:y_max, x_min:x_max]
+    roi = img_bgr[y_min_padded:y_max_padded, x_min_padded:x_max_padded]
     
     if roi.size == 0:
         # Fallback: usar polígono original
@@ -399,10 +421,75 @@ def create_mask_morphology(polygon, img_bgr, nearby_words=None):
             cv2.THRESH_BINARY_INV, 11, 2
         )
     
-    # Operaciones morfológicas para limpiar
+    # 🆕 RESTRICCIÓN AL POLÍGONO ORIGINAL: Crear máscara del polígono en el ROI (para limpieza de ruido)
+    polygon_mask_roi_original = np.zeros((roi_gray.shape[0], roi_gray.shape[1]), dtype=np.uint8)
+    # Ajustar coordenadas del polígono al sistema de coordenadas del ROI
+    polygon_roi_original = points.copy()
+    polygon_roi_original[:, 0] -= x_min_padded
+    polygon_roi_original[:, 1] -= y_min_padded
+    cv2.fillPoly(polygon_mask_roi_original, [polygon_roi_original.astype(np.int32)], 255)
+    
+    # 🆕 LIMPIAR RUIDO: Eliminar componentes pequeñas SOLO si están FUERA del polígono original
+    # Esto preserva tildes, puntos y partes pequeñas de letras que están dentro del texto
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_roi, connectivity=8)
+    min_area = (roi_gray.shape[0] * roi_gray.shape[1]) * 0.005  # Reducido a 0.5% para ser menos agresivo
+    mask_roi_cleaned = np.zeros_like(mask_roi)
+    for i in range(1, num_labels):  # Empezar en 1 para omitir el fondo
+        component_area = stats[i, cv2.CC_STAT_AREA]
+        # Obtener la máscara de esta componente
+        component_mask = (labels == i).astype(np.uint8) * 255
+        # Verificar si la componente está dentro del polígono original
+        component_in_polygon = cv2.bitwise_and(component_mask, polygon_mask_roi_original)
+        pixels_in_polygon = np.sum(component_in_polygon > 0)
+        pixels_in_component = np.sum(component_mask > 0)
+        # Si más del 50% de la componente está dentro del polígono, mantenerla (preserva tildes, etc.)
+        # O si es grande, mantenerla siempre
+        if pixels_in_polygon > 0 and (pixels_in_polygon / pixels_in_component > 0.5 or component_area >= min_area):
+            mask_roi_cleaned[labels == i] = 255
+        # Si está fuera del polígono y es pequeña, eliminarla (ruido)
+        elif component_area >= min_area:
+            mask_roi_cleaned[labels == i] = 255
+    mask_roi = mask_roi_cleaned
+    
+    # 🆕 RESTRICCIÓN AL POLÍGONO ORIGINAL (EXPANDIDO): Crear máscara del polígono expandido en el ROI
+    polygon_mask_roi = np.zeros((roi_gray.shape[0], roi_gray.shape[1]), dtype=np.uint8)
+    # Usar el polígono original para expandir
+    polygon_roi = polygon_roi_original.copy()
+    
+    # 🆕 Expandir el polígono un poco para permitir borrado más completo
+    if POLYGON_EXPANSION_PX > 0:
+        # Calcular el centro del polígono
+        M = cv2.moments(polygon_roi.astype(np.int32))
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+        else:
+            cx = int(np.mean(polygon_roi[:, 0]))
+            cy = int(np.mean(polygon_roi[:, 1]))
+        
+        # Expandir desde el centro
+        expanded_polygon_roi = polygon_roi.copy()
+        for i in range(len(expanded_polygon_roi)):
+            dx = expanded_polygon_roi[i, 0] - cx
+            dy = expanded_polygon_roi[i, 1] - cy
+            # Normalizar y expandir
+            if dx != 0 or dy != 0:
+                length = np.sqrt(dx*dx + dy*dy)
+                expanded_polygon_roi[i, 0] = cx + (dx / length) * (length + POLYGON_EXPANSION_PX)
+                expanded_polygon_roi[i, 1] = cy + (dy / length) * (length + POLYGON_EXPANSION_PX)
+        polygon_roi = expanded_polygon_roi
+    
+    cv2.fillPoly(polygon_mask_roi, [polygon_roi.astype(np.int32)], 255)
+    
+    # 🆕 Aplicar restricción: solo mantener píxeles dentro del polígono expandido
+    mask_roi = cv2.bitwise_and(mask_roi, polygon_mask_roi)
+    
+    # Operaciones morfológicas para limpiar y expandir
     if MORPH_DILATE_KERNEL > 0:
         kernel_dilate = np.ones((MORPH_DILATE_KERNEL, MORPH_DILATE_KERNEL), np.uint8)
         mask_roi = cv2.dilate(mask_roi, kernel_dilate, iterations=1)
+        # 🆕 Re-aplicar restricción después de dilatar (con polígono expandido)
+        mask_roi = cv2.bitwise_and(mask_roi, polygon_mask_roi)
     
     if MORPH_ERODE_KERNEL > 0:
         kernel_erode = np.ones((MORPH_ERODE_KERNEL, MORPH_ERODE_KERNEL), np.uint8)
@@ -410,7 +497,7 @@ def create_mask_morphology(polygon, img_bgr, nearby_words=None):
     
     # Colocar máscara ROI en la imagen completa
     mask_full = np.zeros((h_img, w_img), dtype=np.uint8)
-    mask_full[y_min:y_max, x_min:x_max] = mask_roi
+    mask_full[y_min_padded:y_max_padded, x_min_padded:x_max_padded] = mask_roi
     
     # Debug: mostrar área detectada antes de exclusiones
     area_before = np.sum(mask_full > 0)
@@ -433,7 +520,7 @@ def create_mask_morphology(polygon, img_bgr, nearby_words=None):
         # Obtener el contorno más grande
         largest_contour = max(contours, key=cv2.contourArea)
         # Ajustar coordenadas al sistema de la imagen completa
-        largest_contour = largest_contour + np.array([x_min, y_min])
+        largest_contour = largest_contour + np.array([x_min_padded, y_min_padded])
         vis_polygon = largest_contour.squeeze()
     else:
         vis_polygon = points
